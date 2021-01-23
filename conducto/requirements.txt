@@ -1,0 +1,2 @@
+conducto==0.1.14
+PyYAML==5.4.1

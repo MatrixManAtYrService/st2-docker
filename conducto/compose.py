@@ -1,3 +1,4 @@
+import yaml
 import json
 from textwrap import indent
 from collections import namedtuple
@@ -5,14 +6,17 @@ from pathlib import Path
 import conducto as co
 import os
 
+# components for use with co.Image
 image = "docker/compose"
 reqs_py = ["conducto", "docker-py", "sh", "pyyaml"]
 
-# generate this file (stash it next to docker-compose.yml)
-staged = ".docker-compose.yml.g"
+# generate this file to define microservices
+# (stash it next to docker-compose.yml)
+staged = "docker-compose.yml.g"
 
-# prefix commands with this to use the staged dockerfile
-cmd = "docker-compose -f " + staged
+# use this instead of "docker-compose" to scope your action to this pipeline's
+# services
+cmd = f"docker-compose -f {staged} -p $CONDUCTO_PIPELINE_ID"
 
 
 def inspect(service_name, print_data=False):
@@ -29,14 +33,15 @@ def inspect(service_name, print_data=False):
     return data
 
 
-IPs = namedtuple("IPs", "conducto others")
-
-
 def ip(service_name, print_data=False):
     """
     If 'up' was called in this pipeline inspect details will be stashed
     Get the IP address for this service from the stashed inspect
     """
+
+    # return one of these
+    IPs = namedtuple("IPs", "conducto others")
+
     pipeline_id = os.environ["CONDUCTO_PIPELINE_ID"]
 
     data = inspect(service_name)
@@ -45,7 +50,7 @@ def ip(service_name, print_data=False):
     network_names = []
     for name, network in data["NetworkSettings"]["Networks"].items():
         network_names.append(name)
-        if pipeline_id in name:
+        if 'conducto_network_' in name and pipeline_id in name:
             conducto = network["IPAddress"]
         else:
             others.append(network["IPAddress"])
@@ -64,8 +69,10 @@ def ip(service_name, print_data=False):
 def down(path_to_yml=staged) -> co.Exec:
     return co.Exec(f"docker-compose -f {path_to_yml} down")
 
+
 def exec(service, command, path_to_yml=staged) -> co.Exec:
-    return co.Exec(f"docker-compose -f {path_to_yml} exec -T {service} {command}")
+    return co.Exec(f"docker-compose -f {path_to_yml} -p $CONDUCTO_PIPELINE_ID exec -T {service} {command}")
+
 
 def _print_val(key, getfunc, json=False):
     """
@@ -93,11 +100,14 @@ def _store_container_info(key, datum):
         co.data.pipeline.puts(key, json.dumps(datum).encode())
         _print_val(key, co.data.pipeline.gets)
 
+
 def up(path_to_yml=staged) -> co.Serial:
     node = co.Serial()
-    node["start services"] = co.Exec(f"docker-compose -f {path_to_yml} up -d")
+    node["start services"] = co.Exec(
+        f"docker-compose -f {path_to_yml} -p $CONDUCTO_PIPELINE_ID up -d")
     node["collect metadata"] = co.Exec(examine, path_to_yml)
     return node
+
 
 def examine(path_to_yml):
     """
@@ -107,8 +117,9 @@ def examine(path_to_yml):
     from sh import docker_compose
 
     # reference this docker-compose file
+    pipeline_id = os.environ["CONDUCTO_PIPELINE_ID"]
     def args(*compose_args):
-        return ["-f", path_to_yml] + list(compose_args)
+        return ["-f", path_to_yml, "-p", pipeline_id] + list(compose_args)
 
     # start services if not started
     service_names = (
@@ -216,8 +227,6 @@ def stage(host_compose, image_compose=None, volumes={}):
     Find docker-compose.yml and generate docker-compose.yml.g with
     necessary changes
     """
-
-    import yaml
     from pathlib import Path
 
     # situate files
@@ -237,7 +246,17 @@ def stage(host_compose, image_compose=None, volumes={}):
         content = yaml.load(f, Loader=yaml.FullLoader)
 
     # mutate
+    count = 0
     altered = anchored(content, host_compose)
+    for service, service_def in altered["services"].items():
+        try:
+            mount = volumes[service]
+            altered["services"][service].setdefault("volumes", []).append(mount)
+            count += 1
+        except KeyError:
+            pass
+    if count:
+        print(f"will mount {count} extra dev volumes")
 
     # write
     with open(target, "w") as f:
